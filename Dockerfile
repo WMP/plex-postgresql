@@ -105,7 +105,26 @@ RUN mkdir -p /etc/s6-overlay/s6-rc.d/init-plex-postgresql && \
     mkdir -p /etc/s6-overlay/s6-rc.d/user/contents.d && \
     touch /etc/s6-overlay/s6-rc.d/user/contents.d/init-plex-postgresql && \
     mkdir -p /etc/s6-overlay/s6-rc.d/svc-plex/dependencies.d && \
-    touch /etc/s6-overlay/s6-rc.d/svc-plex/dependencies.d/init-plex-postgresql
+    touch /etc/s6-overlay/s6-rc.d/svc-plex/dependencies.d/init-plex-postgresql && \
+    mkdir -p /etc/s6-overlay/s6-rc.d/init-plex-postgresql/dependencies.d && \
+    touch /etc/s6-overlay/s6-rc.d/init-plex-postgresql/dependencies.d/init-adduser
+
+# Order this init AFTER the base image's own ownership pass.
+# Without a dependency edge s6-rc starts init-plex-postgresql immediately, so it
+# races three things in the base image:
+#   - init-adduser, which remaps abc to PUID/PGID: a chown that lands first
+#     writes the image default (911) instead of the configured uid;
+#   - init-plex-chown's walk of /config/Library, which reads ownership from a
+#     tree this init is still changing;
+#   - init-plex-chown's "rm -rf ${TMPDIR}; mkdir -p ${TMPDIR}", where TMPDIR is
+#     /run/plex-temp - the same path ensure_plex_temp_dir() creates and chmods
+#     to 1777, so the base image can delete it right after we set it up.
+# init-plex-chown already depends on init-config -> init-os-end -> init-adduser,
+# so this edge covers all three.
+RUN if [ -d /etc/s6-overlay/s6-rc.d/init-plex-chown ]; then \
+        touch /etc/s6-overlay/s6-rc.d/init-plex-postgresql/dependencies.d/init-plex-chown && \
+        echo "init-plex-postgresql ordered after init-plex-chown"; \
+    fi
 
 # Fix claim script: inject LD_PRELOAD into the temporary Plex start during claim
 # The base image's init-plex-claim starts Plex without our shim, which crashes

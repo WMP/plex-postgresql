@@ -49,6 +49,24 @@ PG_USER="${PLEX_PG_USER:-plex}"
 PG_SCHEMA="${PLEX_PG_SCHEMA:-plex}"
 SHIM_DIR="/usr/local/lib/plex-postgresql"
 
+# Ownership for the files this script creates.
+# Numeric PUID/PGID, not the name "abc": this init can run before the base
+# image's init-adduser remaps abc to PUID/PGID, and a name lookup would then
+# write the image default (911) instead of the configured uid.
+PLEX_UID="${PUID:-911}"
+PLEX_GID="${PGID:-911}"
+
+# Hand a path to the Plex user. Never recursive.
+# A recursive chown over the library is not free: it costs one lchown syscall
+# per entry, and a Metadata tree holds hundreds of thousands of small files.
+# On a bind mount, NFS or Docker Desktop every one of those is a round trip, so
+# the walk adds minutes to every container start. The base image already owns
+# the repair case: its init-plex-chown does a recursive pass only when
+# /config/Library has the wrong uid. See repair_config_ownership() below.
+plex_chown() {
+    chown "$PLEX_UID:$PLEX_GID" "$@" 2>/dev/null || true
+}
+
 # Non-interactive mode for Docker (auto-migrate if PG is empty)
 MIGRATION_INTERACTIVE="${MIGRATION_INTERACTIVE:-0}"
 
@@ -230,7 +248,7 @@ init_single_sqlite_db() {
     else
         echo "WARNING: Schema file not found: $schema_file"
     fi
-    chown abc:abc "$db_file" 2>/dev/null || true
+    plex_chown "$db_file" "${db_file}-shm" "${db_file}-wal"
 
     # Sync migration versions from PG to SQLite
     # This prevents Plex from re-running migrations that are already in PostgreSQL
@@ -276,8 +294,16 @@ PREFEOF
         echo "Created initial Preferences.xml (MachineIdentifier=${machine_id})"
     fi
 
-    # Set ownership to abc:abc (PUID:PGID from environment)
-    chown -R abc:abc "$plex_dir" 2>/dev/null || true
+    # Only the entries this function created.
+    plex_chown "$plex_dir" \
+        "$plex_dir/Plug-ins" \
+        "$plex_dir/Metadata" \
+        "$plex_dir/Cache" \
+        "$plex_dir/Logs" \
+        "$plex_dir/Crash Reports"
+    if [[ -f "$plex_dir/Preferences.xml" ]]; then
+        plex_chown "$plex_dir/Preferences.xml"
+    fi
 
     echo "Plex directories initialized"
 }
@@ -304,7 +330,7 @@ clear_flags_dat() {
     ts=$(date +%Y%m%d_%H%M%S)
     local backup="${flags_file}.bad.${ts}"
     mv "$flags_file" "$backup"
-    chown abc:abc "$backup" 2>/dev/null || true
+    plex_chown "$backup"
     echo "WARNING: Flags.dat moved aside due to UUID parsing failure: $backup"
 }
 
@@ -370,11 +396,40 @@ ensure_plex_temp_dir() {
     # Plex expects this path to exist and be a directory.
     mkdir -p "$temp_dir"
     chmod 1777 "$temp_dir" 2>/dev/null || true
-    chown abc:abc "$temp_dir" 2>/dev/null || true
+    plex_chown "$temp_dir"
 }
 
 # Locale setup removed — Plex's bundled musl+boost::locale handles locale internally.
 # Setting LANG/LC_ALL/CHARSET can interfere with exception handling on aarch64.
+
+# One-off ownership repair for an imported library.
+# PLEX_PG_CHOWN_CONFIG=auto (default) walks the tree only when the library root
+# carries the wrong uid, which is the case after a library is copied in from
+# another host. =1 forces one pass, =0 never walks. Steady-state restarts pay a
+# single stat.
+repair_config_ownership() {
+    local plex_dir="/config/Library/Application Support/Plex Media Server"
+    local mode="${PLEX_PG_CHOWN_CONFIG:-auto}"
+    local current_uid
+
+    case "$mode" in
+        0|no|off|false) return 0 ;;
+        1|yes|on|true) ;;
+        *)
+            if [[ "$mode" != "auto" ]]; then
+                echo "WARNING: Unknown PLEX_PG_CHOWN_CONFIG value '$mode', falling back to auto"
+            fi
+            [[ -d "$plex_dir" ]] || return 0
+            current_uid=$(stat -c %u "$plex_dir" 2>/dev/null || echo "$PLEX_UID")
+            [[ "$current_uid" == "$PLEX_UID" ]] && return 0
+            echo "Ownership mismatch on $plex_dir (uid $current_uid, expected $PLEX_UID)"
+            ;;
+    esac
+
+    echo "Repairing ownership under $plex_dir - this can take several minutes on a large library..."
+    chown -R "$PLEX_UID:$PLEX_GID" "$plex_dir" 2>/dev/null || true
+    echo "Ownership repair complete"
+}
 
 # Verify PostgreSQL shim configuration
 # Note: The shim is now injected at Docker build time via Dockerfile
@@ -480,11 +535,10 @@ if [ -n "$PLEX_PG_HOST" ]; then
     init_sqlite_schema
     verify_plex_shim
     verify_media_mount
-    
-    # Final permission fix - ensure Plex can write to its directories
-    # This must be done after all directories are created
-    echo "Fixing final permissions..."
-    chown -R abc:abc "/config/Library/Application Support/Plex Media Server" 2>/dev/null || true
+
+    # The helpers above already own every path this script creates, so there is
+    # no blanket pass here. This only repairs an imported library.
+    repair_config_ownership
 else
     echo "PLEX_PG_HOST not set, skipping PostgreSQL initialization"
 fi

@@ -331,6 +331,7 @@ Use this command to migrate an existing Plex library to PostgreSQL:
 | `PLEX_PG_LOG_LEVEL` | 1 | 0=ERROR, 1=INFO, 2=DEBUG |
 | `PLEX_PG_RETRY_DELAYS` | 500,1000,2000,3000,4000 | PG reconnect backoff in ms (comma-separated, max 10 values) |
 | `PLEX_PG_SKIP_CLEAR_BINDINGS_FINALIZED` | 1 | Skip `sqlite3_clear_bindings` for recently finalized statements to avoid UAF crashes (set 0 to disable) |
+| `PLEX_PG_CHOWN_CONFIG` | auto | Ownership repair of the Plex library at container start. `auto` walks the tree only when its uid does not match `PUID`; `1` forces one pass; `0` never walks. Docker only |
 
 ### Unix Socket vs TCP
 
